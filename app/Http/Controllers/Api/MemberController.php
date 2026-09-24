@@ -28,6 +28,7 @@ class MemberController extends Controller
                 'department'      => $member->department,
                 'join_date'       => $member->created_at->format('F Y'),
                 'status'          => $member->status,
+                'has_pin'         => (bool) $member->transaction_pin,
                 'balance'         => $account->balance ?? 0,
                 'savings'         => $account->savings_balance ?? 0,
                 'shares'          => $account->shares_balance ?? 0,
@@ -80,8 +81,8 @@ class MemberController extends Controller
 
     public function updateProfile(Request $request)
     {
-        $request->validate(['address' => 'nullable|string', 'phone_number' => 'nullable|string|max:15', 'fcm_token' => 'nullable|string']);
-        $request->user()->update($request->only(['address', 'phone_number', 'fcm_token']));
+        $request->validate(['address' => 'nullable|string', 'phone_number' => 'nullable|string|max:15', 'department' => 'nullable|string|in:' . implode(',', AuthController::DEPARTMENTS), 'fcm_token' => 'nullable|string']);
+        $request->user()->update($request->only(['address', 'phone_number', 'department', 'fcm_token']));
         return response()->json(['success' => true, 'message' => 'Profile updated']);
     }
 

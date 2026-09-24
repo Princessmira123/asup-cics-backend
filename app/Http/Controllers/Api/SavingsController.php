@@ -7,6 +7,7 @@ use App\Models\Account;
 use App\Models\Transaction;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 
 class SavingsController extends Controller
@@ -27,8 +28,16 @@ class SavingsController extends Controller
 
     public function contribute(Request $request)
     {
-        $request->validate(['amount' => 'required|numeric|min:100', 'description' => 'nullable|string']);
+        $request->validate(['amount' => 'required|numeric|min:100', 'description' => 'nullable|string', 'pin' => 'required|digits:4']);
         $member  = $request->user();
+
+        if (!$member->transaction_pin) {
+            return response()->json(['success' => false, 'message' => 'Please set a transaction PIN first, in Settings.'], 400);
+        }
+        if (!Hash::check($request->pin, $member->transaction_pin)) {
+            return response()->json(['success' => false, 'message' => 'Incorrect transaction PIN'], 401);
+        }
+
         $account = Account::where('member_id', $member->id)->first();
 
         DB::beginTransaction();

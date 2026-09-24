@@ -15,6 +15,7 @@ use App\Models\PaymentType;
 use App\Models\Transaction;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 
 class PaymentController extends Controller
@@ -37,9 +38,18 @@ class PaymentController extends Controller
             'payment_type_id' => 'nullable|exists:payment_types,id',
             'label'            => 'required_without:payment_type_id|string|max:100',
             'amount'           => 'required|numeric|min:100',
+            'pin'              => 'required|digits:4',
         ]);
 
         $member  = $request->user();
+
+        if (!$member->transaction_pin) {
+            return response()->json(['success' => false, 'message' => 'Please set a transaction PIN first, in Settings.'], 400);
+        }
+        if (!Hash::check($request->pin, $member->transaction_pin)) {
+            return response()->json(['success' => false, 'message' => 'Incorrect transaction PIN'], 401);
+        }
+
         $account = Account::where('member_id', $member->id)->first();
 
         if (!$account) {

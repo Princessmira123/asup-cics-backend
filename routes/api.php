@@ -23,6 +23,7 @@ Route::prefix('auth')->group(function () {
     Route::post('/login',           [AuthController::class, 'login']);
     Route::post('/admin-login',     [AuthController::class, 'adminLogin']);
     Route::post('/verify-otp',      [AuthController::class, 'verifyOtp']);
+    Route::post('/resend-otp',      [AuthController::class, 'resendOtp']);
     Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
     Route::post('/reset-password',  [AuthController::class, 'resetPassword']);
     Route::post('/refresh-token',   [AuthController::class, 'refreshToken']);
@@ -37,6 +38,7 @@ Route::middleware(['auth:sanctum', 'member.active'])->group(function () {
     Route::post('/auth/verify-pin',       [AuthController::class, 'verifyPin']);
     Route::post('/auth/change-password',  [AuthController::class, 'changePassword']);
     Route::post('/auth/change-pin',       [AuthController::class, 'changePin']);
+    Route::post('/auth/set-pin',          [AuthController::class, 'setPin']);
     Route::post('/auth/biometric-enroll',  [AuthController::class, 'enrollBiometric']);
     Route::get('/auth/biometric-status',   [AuthController::class, 'biometricStatus']);
     Route::post('/auth/biometric-disable', [AuthController::class, 'disableBiometric']);
@@ -56,8 +58,17 @@ Route::middleware(['auth:sanctum', 'member.active'])->group(function () {
     // Transactions
     Route::get('/transactions',           [TransactionController::class, 'index']);
     Route::get('/transactions/{id}',      [TransactionController::class, 'show']);
-    Route::post('/transactions/transfer', [TransactionController::class, 'transfer']);
-    Route::post('/transactions/deposit',  [TransactionController::class, 'deposit']);
+    // NOTE: member-to-member transfer intentionally removed — feature disabled
+    // per request. TransactionController::transfer() is left in place but is
+    // no longer reachable from the API.
+    //
+    // NOTE: TransactionController::deposit() also disabled — it duplicated
+    // SavingsController::contribute() (same effect: credits balance +
+    // savings_balance) but had NO PIN check and no route-level protection.
+    // Nothing in the app ever called it, but it was still live: any
+    // authenticated member could have called it directly to credit their
+    // own account for free, with no PIN and no limit. contribute() is the
+    // one properly-secured path for this now — this one is redundant.
 
     // Savings
     Route::get('/savings',                [SavingsController::class, 'index']);

@@ -13,6 +13,7 @@ use App\Models\Transaction;
 use App\Services\NotificationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 
 class LoanController extends Controller
@@ -85,9 +86,18 @@ class LoanController extends Controller
             'description'      => 'nullable|string',
             'guarantors'       => 'required|array|min:1',
             'guarantors.*.id'  => 'required|string|exists:members,member_id',
+            'pin'              => 'required|digits:4',
         ]);
 
         $member  = $request->user();
+
+        if (!$member->transaction_pin) {
+            return response()->json(['success' => false, 'message' => 'Please set a transaction PIN first, in Settings.'], 400);
+        }
+        if (!Hash::check($request->pin, $member->transaction_pin)) {
+            return response()->json(['success' => false, 'message' => 'Incorrect transaction PIN'], 401);
+        }
+
         $account = Account::where('member_id', $member->id)->first();
 
         // Eligibility checks
@@ -108,8 +118,17 @@ class LoanController extends Controller
 
         DB::beginTransaction();
         try {
+            // rand(1,999) previously gave only 999 possible loan_ids per year
+            // against a unique DB constraint — collisions were realistic for
+            // an active cooperative and would silently fail the whole
+            // application with a generic error. Wider random space + an
+            // explicit uniqueness retry closes that off entirely.
+            do {
+                $loanIdCandidate = 'LN-' . date('Y') . '-' . str_pad(random_int(1, 999999), 6, '0', STR_PAD_LEFT);
+            } while (Loan::where('loan_id', $loanIdCandidate)->exists());
+
             $loan = Loan::create([
-                'loan_id'           => 'LN-' . date('Y') . '-' . str_pad(rand(1, 999), 3, '0', STR_PAD_LEFT),
+                'loan_id'           => $loanIdCandidate,
                 'member_id'         => $member->id,
                 'amount_requested'  => $request->amount,
                 'interest_rate'     => \App\Models\Setting::getFloat('interest_rate', 10),
@@ -198,8 +217,16 @@ class LoanController extends Controller
     // Make repayment
     public function repay(Request $request, $id)
     {
-        $request->validate(['amount' => 'required|numeric|min:1']);
+        $request->validate(['amount' => 'required|numeric|min:1', 'pin' => 'required|digits:4']);
         $member  = $request->user();
+
+        if (!$member->transaction_pin) {
+            return response()->json(['success' => false, 'message' => 'Please set a transaction PIN first, in Settings.'], 400);
+        }
+        if (!Hash::check($request->pin, $member->transaction_pin)) {
+            return response()->json(['success' => false, 'message' => 'Incorrect transaction PIN'], 401);
+        }
+
         $loan    = Loan::where('loan_id', $id)->where('member_id', $member->id)->where('status', 'active')->firstOrFail();
         $account = Account::where('member_id', $member->id)->first();
 

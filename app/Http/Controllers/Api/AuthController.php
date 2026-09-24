@@ -16,6 +16,48 @@ use Illuminate\Support\Str;
 
 class AuthController extends Controller
 {
+    // Must stay in sync with kDepartments in the Flutter app's
+    // lib/utils/constants.dart — this is the server-side source of truth
+    // that rejects anything the dropdown shouldn't have allowed through.
+    // Public: also referenced by MemberController::updateProfile() so
+    // existing members can set/change their department after the fact.
+    public const DEPARTMENTS = [
+        'Computer Science',
+        'Hospitality Management',
+        'Leisure and Tourism Management',
+        'Nutrition and Dietetics',
+        'Science Laboratory Technology',
+        'Geological Technology',
+        'Accountancy',
+        'Banking and Finance',
+        'Business Administration and Management',
+        'Marketing',
+        'Taxation',
+        'Insurance',
+        'Civil Engineering',
+        'Computer Engineering',
+        'Electrical/Electronic Engineering Technology',
+        'Mechanical Engineering Technology',
+        'Agricultural and Bio-Environmental Engineering Technology',
+        'Horticulture and Landscape Technology',
+        'Mechatronics Engineering',
+        'Chemical Engineering Technology',
+        'Architectural Technology',
+        'Building Technology',
+        'Estate Management and Valuation',
+        'Quantity Surveying',
+        'Surveying and Geo-Informatics',
+        'Fashion Design and Clothing Technology',
+        'Library and Information Science',
+        'Office Technology and Management',
+        'Mass Communication',
+        'Physics Electronics',
+        'Microbiology',
+        'Chemistry',
+        'Statistics',
+        'Pharmaceutical Technology',
+    ];
+
     protected $fraudService;
     protected $notifService;
 
@@ -37,10 +79,12 @@ class AuthController extends Controller
             'nin'          => 'required|string|size:11',
             'date_of_birth'=> 'required|date',
             'address'      => 'required|string',
+            'department'   => 'required|string|in:' . implode(',', self::DEPARTMENTS),
             'verification_method' => 'required|in:email,sms',
         ], [
             'email.email'        => 'Please enter a real, valid email address.',
             'phone_number.regex' => 'Please enter a valid Nigerian phone number (e.g. 08012345678).',
+            'department.in'      => 'Please select a valid department from the list.',
         ]);
 
         if ($validator->fails()) {
@@ -73,6 +117,7 @@ class AuthController extends Controller
             'nin'            => $request->nin,
             'date_of_birth'  => $request->date_of_birth,
             'address'        => $request->address,
+            'department'     => $request->department,
             'account_number' => $this->generateAccountNumber(),
             'status'         => 'pending_verification',
         ]);
@@ -158,6 +203,28 @@ class AuthController extends Controller
             return response()->json(['success' => false, 'message' => 'Account suspended. Contact admin.'], 403);
         }
 
+        // A member who registered but never completed OTP verification sits
+        // at 'pending_verification' forever unless we catch it here — without
+        // this check they could log straight in with an unverified email/
+        // phone and no transaction PIN set. Route them back to verification
+        // instead, and hand them a fresh OTP since their first one may have
+        // expired or never arrived.
+        if ($member->status === 'pending_verification') {
+            $otp = $this->generateOtp($member->id, 'email_verification');
+            $this->notifService->sendEmail(
+                $member->email,
+                'ASUP CICS — Verify Your Account',
+                "Hello {$member->full_name},\n\nYour verification code is: {$otp}\nThis code is valid for 10 minutes.\n\nWelcome to ASUP CICS!"
+            );
+            return response()->json([
+                'success'                => false,
+                'requires_verification'  => true,
+                'member_id'              => $member->member_id,
+                'sent_via'               => 'email',
+                'message'                => "Your account hasn't been verified yet. We've sent a new verification code to your email.",
+            ], 403);
+        }
+
         // Check device fingerprint for fraud detection
         $deviceRisk = $this->fraudService->assessDeviceRisk($member->id, $request->device_id);
 
@@ -168,7 +235,8 @@ class AuthController extends Controller
             'success'       => true,
             'message'       => 'Login successful',
             'token'         => $token,
-            'requires_pin'  => true,
+            'requires_pin'  => (bool) $member->transaction_pin,
+            'has_pin'       => (bool) $member->transaction_pin,
             'device_risk'   => $deviceRisk,
             'member'        => [
                 'id'             => $member->member_id,
@@ -178,7 +246,7 @@ class AuthController extends Controller
                 'phone'          => $member->phone_number,
                 'account_number' => $member->account_number,
                 'status'         => $member->status,
-                'avatar'         => strtoupper(substr($member->full_name, 0, 1) . substr(strrchr($member->full_name, ' '), 1, 1)),
+                'avatar'         => strtoupper(substr($member->full_name, 0, 1) . substr(strrchr($member->full_name, ' ') ?? ' ', 1, 1)),
             ],
         ]);
     }
@@ -226,7 +294,26 @@ class AuthController extends Controller
     // ── VERIFY OTP ────────────────────────────────────────────────────────────
     public function verifyOtp(Request $request)
     {
-        $otp = OtpCode::where('member_id', $request->member_id)
+        $request->validate(['member_id' => 'required|string', 'otp' => 'required|string']);
+
+        // CRITICAL FIX: this used to query OtpCode/Member directly with
+        // $request->member_id — but that's the member's PUBLIC identifier
+        // (e.g. "MBR-2026-AB12CD"), the same value returned by register()
+        // and sent by the app. OtpCode.member_id and Member.id are both the
+        // internal numeric primary key, which is a completely different
+        // value. Comparing a string like "MBR-2026-AB12CD" against an
+        // integer column never matches, so this endpoint has been silently
+        // rejecting every correct OTP ever entered — no new member could
+        // ever complete verification this way, regardless of whether the
+        // email/SMS ever arrived. Resolve the public id to the real Member
+        // first, exactly like forgotPassword()/resetPassword() already do
+        // correctly, then use the model consistently from there.
+        $member = Member::where('member_id', $request->member_id)->first();
+        if (!$member) {
+            return response()->json(['success' => false, 'message' => 'Member not found'], 404);
+        }
+
+        $otp = OtpCode::where('member_id', $member->id)
                       ->where('code', $request->otp)
                       ->where('used', false)
                       ->where('expires_at', '>', now())
@@ -237,9 +324,44 @@ class AuthController extends Controller
         }
 
         $otp->update(['used' => true]);
-        Member::where('id', $request->member_id)->update(['status' => 'active']);
+        $member->update(['status' => 'active']);
 
         return response()->json(['success' => true, 'message' => 'OTP verified. Account activated.']);
+    }
+
+    // ── RESEND OTP ───────────────────────────────────────────────────────────
+    // Lets a member on the verification screen (step 4) ask for a new code
+    // without needing to hit login first — e.g. their first code expired,
+    // or the email never arrived because of a mail config issue.
+    public function resendOtp(Request $request)
+    {
+        $request->validate([
+            'member_id'            => 'required|string',
+            'verification_method'  => 'nullable|in:email,sms',
+        ]);
+
+        $member = Member::where('member_id', $request->member_id)->first();
+        if (!$member) {
+            return response()->json(['success' => false, 'message' => 'Member not found'], 404);
+        }
+        if ($member->status !== 'pending_verification') {
+            return response()->json(['success' => false, 'message' => 'This account is already verified — you can log in.'], 422);
+        }
+
+        $channel = $request->input('verification_method', 'email');
+        $otp = $this->generateOtp($member->id, 'email_verification');
+
+        if ($channel === 'sms') {
+            $this->notifService->sendSms($member->phone_number, "Your ASUP CICS verification OTP is: {$otp}. Valid for 10 minutes.");
+        } else {
+            $this->notifService->sendEmail(
+                $member->email,
+                'ASUP CICS — Verify Your Account',
+                "Hello {$member->full_name},\n\nYour verification code is: {$otp}\nThis code is valid for 10 minutes.\n\nWelcome to ASUP CICS!"
+            );
+        }
+
+        return response()->json(['success' => true, 'message' => 'A new verification code has been sent.', 'sent_via' => $channel]);
     }
 
     // ── LOGOUT ────────────────────────────────────────────────────────────────
@@ -286,11 +408,33 @@ class AuthController extends Controller
     {
         $request->validate(['old_pin' => 'required|digits:4', 'new_pin' => 'required|digits:4|confirmed']);
         $member = $request->user();
+        if (!$member->transaction_pin) {
+            return response()->json(['success' => false, 'message' => 'You have not set a transaction PIN yet. Use "Set PIN" instead.'], 400);
+        }
         if (!Hash::check($request->old_pin, $member->transaction_pin)) {
             return response()->json(['success' => false, 'message' => 'Old PIN incorrect'], 401);
         }
         $member->update(['transaction_pin' => Hash::make($request->new_pin)]);
         return response()->json(['success' => true, 'message' => 'PIN changed successfully']);
+    }
+
+    // ── SET PIN (first-time only) ────────────────────────────────────────────
+    // For a member who has never set a transaction PIN — every new
+    // registration starts with transaction_pin = null, and changePin() above
+    // requires knowing the OLD pin, which is impossible for someone who never
+    // had one. This is the only way such a member can ever get a PIN set, so
+    // it deliberately does NOT accept an old_pin — but it refuses to run at
+    // all once a PIN already exists, so it can never be used to bypass
+    // changePin()'s old-PIN check on an account that already has one.
+    public function setPin(Request $request)
+    {
+        $request->validate(['pin' => 'required|digits:4|confirmed']);
+        $member = $request->user();
+        if ($member->transaction_pin) {
+            return response()->json(['success' => false, 'message' => 'You already have a transaction PIN set. Use "Change PIN" instead.'], 400);
+        }
+        $member->update(['transaction_pin' => Hash::make($request->pin)]);
+        return response()->json(['success' => true, 'message' => 'Transaction PIN set successfully']);
     }
 
     // ── BIOMETRIC ENROLL ──────────────────────────────────────────────────────
@@ -358,6 +502,7 @@ class AuthController extends Controller
             'message'      => 'Biometric login successful',
             'token'        => $token,
             'requires_pin' => false,
+            'has_pin'      => (bool) $member->transaction_pin,
             'member'       => [
                 'id'             => $member->member_id,
                 'name'           => $member->full_name,
@@ -366,7 +511,7 @@ class AuthController extends Controller
                 'phone'          => $member->phone_number,
                 'account_number' => $member->account_number,
                 'status'         => $member->status,
-                'avatar'         => strtoupper(substr($member->full_name, 0, 1) . substr(strrchr($member->full_name, ' '), 1, 1)),
+                'avatar'         => strtoupper(substr($member->full_name, 0, 1) . substr(strrchr($member->full_name, ' ') ?? ' ', 1, 1)),
             ],
         ]);
     }

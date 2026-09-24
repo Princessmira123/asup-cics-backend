@@ -35,6 +35,7 @@ class AdminController extends Controller
                 'total_disbursed'        => Loan::where('status', '!=', 'denied')->sum('amount_approved'),
                 'total_savings'          => Account::sum('savings_balance'),
                 'open_fraud_alerts'      => FraudAlert::where('status', 'open')->count(),
+                'pending_household_requests' => \App\Models\HouseholdRequest::where('status', 'pending')->count(),
                 'transactions_today'     => Transaction::whereDate('created_at', today())->count(),
             ],
         ]);
