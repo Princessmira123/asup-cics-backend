@@ -15,6 +15,7 @@ use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\MessageController;
 use App\Http\Controllers\Api\HouseholdController;
 use App\Http\Controllers\Api\PaymentController;
+use App\Http\Controllers\Api\BankController;
 
 // ── PUBLIC ROUTES ─────────────────────────────────────────────────────────────
 Route::prefix('auth')->group(function () {
@@ -29,6 +30,12 @@ Route::prefix('auth')->group(function () {
     Route::post('/refresh-token',   [AuthController::class, 'refreshToken']);
     Route::post('/biometric-login', [AuthController::class, 'biometricLogin']);
 });
+
+// Public — used on the registration form (and re-used on Personal Data →
+// Edit, which is authenticated but hits the same shared endpoint) to verify
+// a real bank account rather than accepting any 10 digits.
+Route::get('/banks',            [BankController::class, 'banks']);
+Route::get('/resolve-account',  [BankController::class, 'resolveAccount']);
 
 // ── PROTECTED MEMBER ROUTES ───────────────────────────────────────────────────
 Route::middleware(['auth:sanctum', 'member.active'])->group(function () {
@@ -131,6 +138,7 @@ Route::middleware(['auth:sanctum', 'admin.auth'])->prefix('admin')->group(functi
     Route::put('/members/{id}/status',    [AdminController::class, 'updateMemberStatus']);
     Route::put('/members/{id}/verify',    [AdminController::class, 'verifyMember']);
     Route::post('/members/{id}/message',  [AdminController::class, 'sendMessage']);
+    Route::delete('/members/{id}',        [AdminController::class, 'deleteMember']);
 
     // Loans
     Route::get('/loans',                  [AdminController::class, 'loans']);
