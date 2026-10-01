@@ -13,6 +13,8 @@ use App\Models\Account;
 use App\Models\Payment;
 use App\Models\PaymentType;
 use App\Models\Transaction;
+use App\Services\FraudDetectionService;
+use App\Services\NotificationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
@@ -20,6 +22,15 @@ use Illuminate\Support\Str;
 
 class PaymentController extends Controller
 {
+    protected $fraudService;
+    protected $notifService;
+
+    public function __construct(FraudDetectionService $fraudService, NotificationService $notifService)
+    {
+        $this->fraudService = $fraudService;
+        $this->notifService = $notifService;
+    }
+
     public function types()
     {
         $types = PaymentType::where('active', true)->get();
@@ -60,6 +71,20 @@ class PaymentController extends Controller
             return response()->json(['success' => false, 'message' => 'Insufficient balance'], 422);
         }
 
+        $riskScore = $this->fraudService->assessTransaction([
+            'member_id'  => $member->id,
+            'amount'     => $request->amount,
+            'type'       => 'other_payment',
+            'account_id' => $account->id,
+        ]);
+
+        if ($riskScore >= 90) {
+            $this->fraudService->createAlert($member->id, null, 'High Risk Payment', $riskScore, $request->amount);
+            $this->notifService->sendFraudAlert($member, $request->amount, $riskScore);
+            $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'High Risk Payment');
+            return response()->json(['success' => false, 'message' => 'Payment blocked due to high fraud risk. Admin has been notified.', 'risk_score' => $riskScore], 403);
+        }
+
         $type  = $request->payment_type_id ? PaymentType::find($request->payment_type_id) : null;
         $label = $type->name ?? $request->label;
 
@@ -76,8 +101,8 @@ class PaymentController extends Controller
                 'amount'           => $request->amount,
                 'reference_number' => $reference,
                 'description'      => $label,
-                'risk_score'       => 0,
-                'fraud_flag'       => false,
+                'risk_score'       => $riskScore,
+                'fraud_flag'       => $riskScore >= 70,
                 'status'           => 'completed',
             ]);
 
@@ -91,6 +116,12 @@ class PaymentController extends Controller
             ]);
 
             DB::commit();
+
+            if ($riskScore >= 70) {
+                $this->fraudService->createAlert($member->id, null, 'Flagged Payment', $riskScore, $request->amount);
+                $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'Flagged Payment');
+            }
+
             return response()->json([
                 'success'     => true,
                 'message'     => 'Payment completed',

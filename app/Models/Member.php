@@ -8,7 +8,8 @@ class Member extends Authenticatable {
     use HasApiTokens;
     protected $fillable = ['member_id','full_name','staff_id','email','phone_number','password_hash',
         'transaction_pin','biometric_token','biometric_secret_hash','biometric_device_id',
-        'biometric_device_name','biometric_enrolled_at','account_number','nin','date_of_birth','address',
+        'biometric_device_name','biometric_enrolled_at','account_number','bank_name','bank_code',
+        'verified_account_name','nin','date_of_birth','address',
         'department','fcm_token','status','last_login'];
     protected $hidden = ['password_hash','transaction_pin','biometric_token','biometric_secret_hash'];
     public function account() { return $this->hasOne(Account::class); }

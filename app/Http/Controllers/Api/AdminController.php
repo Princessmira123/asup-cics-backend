@@ -90,6 +90,29 @@ class AdminController extends Controller
         return response()->json(['success' => true, 'message' => 'Member status updated']);
     }
 
+    // ── DELETE MEMBER ────────────────────────────────────────────────────────
+    // Permanently removes a member and everything tied to them (account,
+    // transactions, loans, savings, guarantor records, household requests —
+    // all cascade-delete via the FK constraints on members.id). Also frees
+    // their Staff ID back up on the authorized roster so the same person can
+    // register again from scratch — without this second step, deleting the
+    // member would leave their staff_id permanently marked "already used"
+    // with no way to ever re-register.
+    public function deleteMember($id)
+    {
+        $member = Member::where('member_id', $id)->first();
+        if (!$member) {
+            return response()->json(['success' => false, 'message' => 'Member not found'], 404);
+        }
+
+        $staffId = $member->staff_id;
+        $member->delete();
+
+        \App\Models\AuthorizedStaff::where('staff_id', $staffId)->update(['is_registered' => false]);
+
+        return response()->json(['success' => true, 'message' => 'Member deleted and their Staff ID freed for re-registration']);
+    }
+
     // Lets an admin manually approve a member who is stuck at
     // "pending_verification" — most commonly because the OTP SMS never
     // arrived (e.g. no funded SMS gateway configured). This is a genuine,
@@ -136,7 +159,41 @@ class AdminController extends Controller
     {
         $request->validate(['status' => 'required|in:approved,rejected', 'admin_notes' => 'nullable|string']);
         $hr = \App\Models\HouseholdRequest::findOrFail($id);
-        $hr->update(['status' => $request->status, 'admin_notes' => $request->admin_notes]);
+
+        // Guard against double-crediting if an already-approved request is
+        // somehow approved again (e.g. a double-tap, or re-submitting the
+        // same action) — only the transition INTO 'approved' pays out.
+        $alreadyApproved = $hr->status === 'approved';
+
+        DB::beginTransaction();
+        try {
+            $hr->update(['status' => $request->status, 'admin_notes' => $request->admin_notes]);
+
+            if ($request->status === 'approved' && !$alreadyApproved) {
+                $account = Account::where('member_id', $hr->member_id)->first();
+                if ($account) {
+                    $account->increment('balance', $hr->amount_requested);
+
+                    Transaction::create([
+                        'account_id'       => $account->id,
+                        'member_id'        => $hr->member_id,
+                        'transaction_type' => 'credit',
+                        'amount'           => $hr->amount_requested,
+                        'reference_number' => 'HH-' . $hr->id . '-' . now()->format('Ymd'),
+                        'description'      => 'Household Support Approved - ' . $hr->operation_type,
+                        'risk_score'       => 0,
+                        'fraud_flag'       => false,
+                        'status'           => 'completed',
+                    ]);
+                }
+            }
+
+            DB::commit();
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['success' => false, 'message' => 'Could not update household request'], 500);
+        }
+
         return response()->json(['success' => true, 'message' => 'Household request updated']);
     }
 

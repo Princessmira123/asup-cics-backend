@@ -5,6 +5,8 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Account;
 use App\Models\Transaction;
+use App\Services\FraudDetectionService;
+use App\Services\NotificationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
@@ -12,6 +14,15 @@ use Illuminate\Support\Str;
 
 class SavingsController extends Controller
 {
+    protected $fraudService;
+    protected $notifService;
+
+    public function __construct(FraudDetectionService $fraudService, NotificationService $notifService)
+    {
+        $this->fraudService = $fraudService;
+        $this->notifService = $notifService;
+    }
+
     public function index(Request $request)
     {
         $member  = $request->user();
@@ -40,6 +51,27 @@ class SavingsController extends Controller
 
         $account = Account::where('member_id', $member->id)->first();
 
+        // Fraud check — same convention as the (now-removed) transfer
+        // feature used: >=90 blocks outright, 70-89 goes through but gets
+        // flagged for admin review. Most of the 6 rules inside
+        // assessTransaction() specifically look at debit history, so for a
+        // credit like a savings contribution only amount-threshold,
+        // velocity and unusual-hour meaningfully apply here — that's
+        // intentional, not a gap.
+        $riskScore = $this->fraudService->assessTransaction([
+            'member_id'  => $member->id,
+            'amount'     => $request->amount,
+            'type'       => 'savings_contribution',
+            'account_id' => $account->id,
+        ]);
+
+        if ($riskScore >= 90) {
+            $this->fraudService->createAlert($member->id, null, 'High Risk Savings Contribution', $riskScore, $request->amount);
+            $this->notifService->sendFraudAlert($member, $request->amount, $riskScore);
+            $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'High Risk Savings Contribution');
+            return response()->json(['success' => false, 'message' => 'Transaction blocked due to high fraud risk. Admin has been notified.', 'risk_score' => $riskScore], 403);
+        }
+
         DB::beginTransaction();
         try {
             $account->increment('balance', $request->amount);
@@ -52,12 +84,18 @@ class SavingsController extends Controller
                 'amount'           => $request->amount,
                 'reference_number' => 'SAV-' . strtoupper(Str::random(8)),
                 'description'      => $request->description ?? 'Savings Contribution',
-                'risk_score'       => 0,
-                'fraud_flag'       => false,
+                'risk_score'       => $riskScore,
+                'fraud_flag'       => $riskScore >= 70,
                 'status'           => 'completed',
             ]);
 
             DB::commit();
+
+            if ($riskScore >= 70) {
+                $this->fraudService->createAlert($member->id, null, 'Flagged Savings Contribution', $riskScore, $request->amount);
+                $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'Flagged Savings Contribution');
+            }
+
             return response()->json([
                 'success'         => true,
                 'message'         => 'Contribution recorded',

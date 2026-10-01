@@ -75,6 +75,8 @@ class AuthController extends Controller
             'staff_id'     => 'required|string|unique:members,staff_id',
             'email'        => 'required|email:rfc,dns|unique:members,email',
             'phone_number' => ['required', 'string', 'regex:/^(\+?234|0)[789][01]\d{8}$/', 'unique:members,phone_number'],
+            'account_number' => 'required|digits:10|unique:members,account_number',
+            'bank_code'      => 'required|string',
             'password'     => 'required|string|min:8|confirmed',
             'nin'          => 'required|string|size:11',
             'date_of_birth'=> 'required|date',
@@ -107,6 +109,28 @@ class AuthController extends Controller
             return response()->json(['success' => false, 'message' => 'The selected name does not match the selected Staff ID.'], 422);
         }
 
+        // Re-verify the account number server-side even though the app
+        // already resolved it during the form — the app's check is just for
+        // the person's convenience (showing them the account name to
+        // confirm); this one is the actual security boundary, since a
+        // request straight to this endpoint could otherwise skip the app's
+        // check entirely and register with an unverified account number.
+        $paystackKey = config('services.paystack.secret_key', env('PAYSTACK_SECRET_KEY'));
+        $verifiedAccountName = null;
+        if ($paystackKey) {
+            $resolve = \Illuminate\Support\Facades\Http::withToken($paystackKey)->get('https://api.paystack.co/bank/resolve', [
+                'account_number' => $request->account_number,
+                'bank_code'      => $request->bank_code,
+            ]);
+            if (!$resolve->successful()) {
+                return response()->json(['success' => false, 'message' => 'That account number could not be verified against the selected bank. Please check it and try again.'], 422);
+            }
+            $verifiedAccountName = $resolve->json('data.account_name');
+        }
+
+        $bankName = collect(\Illuminate\Support\Facades\Cache::get('paystack_banks_ng', []))
+            ->firstWhere('code', $request->bank_code)['name'] ?? null;
+
         $member = Member::create([
             'member_id'      => 'MBR-' . date('Y') . '-' . strtoupper(Str::random(6)),
             'full_name'      => $request->full_name,
@@ -118,7 +142,10 @@ class AuthController extends Controller
             'date_of_birth'  => $request->date_of_birth,
             'address'        => $request->address,
             'department'     => $request->department,
-            'account_number' => $this->generateAccountNumber(),
+            'account_number' => $request->account_number,
+            'bank_code'      => $request->bank_code,
+            'bank_name'      => $bankName,
+            'verified_account_name' => $verifiedAccountName,
             'status'         => 'pending_verification',
         ]);
 

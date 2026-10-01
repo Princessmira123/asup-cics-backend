@@ -10,6 +10,7 @@ use App\Models\LoanGuarantor;
 use App\Models\Account;
 use App\Models\Member;
 use App\Models\Transaction;
+use App\Services\FraudDetectionService;
 use App\Services\NotificationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -18,10 +19,12 @@ use Illuminate\Support\Str;
 
 class LoanController extends Controller
 {
+    protected $fraudService;
     protected $notifService;
 
-    public function __construct(NotificationService $notifService)
+    public function __construct(FraudDetectionService $fraudService, NotificationService $notifService)
     {
+        $this->fraudService = $fraudService;
         $this->notifService = $notifService;
     }
 
@@ -100,6 +103,24 @@ class LoanController extends Controller
 
         $account = Account::where('member_id', $member->id)->first();
 
+        // Fraud check on the requested amount — a member suddenly asking
+        // for an unusually large loan (relative to normal amount/velocity
+        // rules) is itself worth flagging, before it ever reaches an admin
+        // for approval.
+        $riskScore = $this->fraudService->assessTransaction([
+            'member_id'  => $member->id,
+            'amount'     => $request->amount,
+            'type'       => 'loan_application',
+            'account_id' => $account->id,
+        ]);
+
+        if ($riskScore >= 90) {
+            $this->fraudService->createAlert($member->id, null, 'High Risk Loan Application', $riskScore, $request->amount);
+            $this->notifService->sendFraudAlert($member, $request->amount, $riskScore);
+            $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'High Risk Loan Application');
+            return response()->json(['success' => false, 'message' => 'Application blocked due to high fraud risk. Admin has been notified.', 'risk_score' => $riskScore], 403);
+        }
+
         // Eligibility checks
         if (Loan::where('member_id', $member->id)->where('status', 'active')->exists()) {
             return response()->json(['success' => false, 'message' => 'You already have an active loan'], 400);
@@ -139,7 +160,14 @@ class LoanController extends Controller
                 'commence_year'     => $request->commence_year,
                 'status'            => 'pending',
                 'application_date'  => now(),
+                'risk_score'        => $riskScore,
+                'fraud_flag'        => $riskScore >= 70,
             ]);
+
+            if ($riskScore >= 70) {
+                $this->fraudService->createAlert($member->id, null, 'Flagged Loan Application', $riskScore, $request->amount);
+                $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'Flagged Loan Application');
+            }
 
             // Add guarantors
             foreach ($request->guarantors as $g) {
@@ -234,6 +262,20 @@ class LoanController extends Controller
             return response()->json(['success' => false, 'message' => 'Insufficient balance'], 400);
         }
 
+        $riskScore = $this->fraudService->assessTransaction([
+            'member_id'  => $member->id,
+            'amount'     => $request->amount,
+            'type'       => 'loan_repayment',
+            'account_id' => $account->id,
+        ]);
+
+        if ($riskScore >= 90) {
+            $this->fraudService->createAlert($member->id, null, 'High Risk Loan Repayment', $riskScore, $request->amount);
+            $this->notifService->sendFraudAlert($member, $request->amount, $riskScore);
+            $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'High Risk Loan Repayment');
+            return response()->json(['success' => false, 'message' => 'Repayment blocked due to high fraud risk. Admin has been notified.', 'risk_score' => $riskScore], 403);
+        }
+
         DB::beginTransaction();
         try {
             $totalPaid  = LoanRepayment::where('loan_id', $loan->id)->sum('amount_paid');
@@ -257,8 +299,8 @@ class LoanController extends Controller
                 'amount'           => $request->amount,
                 'reference_number' => 'REP-' . strtoupper(Str::random(8)),
                 'description'      => 'Loan Repayment - ' . $loan->loan_id,
-                'risk_score'       => 0,
-                'fraud_flag'       => false,
+                'risk_score'       => $riskScore,
+                'fraud_flag'       => $riskScore >= 70,
                 'status'           => 'completed',
             ]);
 
@@ -268,6 +310,11 @@ class LoanController extends Controller
             }
 
             DB::commit();
+
+            if ($riskScore >= 70) {
+                $this->fraudService->createAlert($member->id, null, 'Flagged Loan Repayment', $riskScore, $request->amount);
+                $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'Flagged Loan Repayment');
+            }
 
             return response()->json([
                 'success'     => true,

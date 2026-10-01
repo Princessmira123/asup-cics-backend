@@ -119,6 +119,34 @@ class NotificationService
         );
     }
 
+    // ── FRAUD ALERT — ADMIN EMAIL ────────────────────────────────────────────
+    // The member-facing sendFraudAlert() above relies on push (needs
+    // FCM_SERVER_KEY) and SMS (needs TERMII_API_KEY) — both silently do
+    // nothing if those aren't configured, which means an admin could have
+    // zero way of ever finding out an alert was raised, short of manually
+    // opening the Fraud Management tab. Email already works reliably (Gmail
+    // SMTP), so this is the one channel guaranteed to actually reach
+    // someone the moment PAYSTACK/MAIL config exists — no extra service
+    // signup needed.
+    public function sendFraudAlertToAdmins(string $memberName, string $memberIdentifier, float $amount, int $riskScore, string $alertType): void
+    {
+        $admins = \App\Models\AdminUser::pluck('email');
+        if ($admins->isEmpty()) return;
+
+        $subject = $riskScore >= 90 ? '🚨 BLOCKED — Critical Fraud Alert' : '⚠️ Fraud Alert Flagged for Review';
+        $body = "A transaction has been flagged by fraud detection.\n\n"
+              . "Member: {$memberName} ({$memberIdentifier})\n"
+              . "Amount: ₦" . number_format($amount, 2) . "\n"
+              . "Risk Score: {$riskScore}/100\n"
+              . "Type: {$alertType}\n"
+              . ($riskScore >= 90 ? "\nThis transaction was automatically BLOCKED and did not go through.\n" : "\nThis transaction went through but was flagged for review.\n")
+              . "\nOpen the admin panel's Fraud Management tab to review.";
+
+        foreach ($admins as $email) {
+            $this->sendEmail($email, $subject, $body);
+        }
+    }
+
     // Termii expects international format (234XXXXXXXXXX) — this converts
     // common local formats (0801..., +234801...) into that shape.
     private function normalizePhone(string $phone): string
