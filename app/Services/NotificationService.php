@@ -4,7 +4,10 @@
 // REAL provider integrations:
 //   - Push: Firebase Cloud Messaging (legacy HTTP API, server-key auth)
 //   - SMS:  Termii (widely used Nigerian SMS gateway)
-//   - Email: Laravel's built-in Mail facade
+//   - Email: Resend's HTTPS API (NOT raw SMTP — see sendEmail() below for
+//     why: Railway, and likely other PaaS hosts, block outbound SMTP
+//     entirely on free tiers, which is what was actually breaking
+//     registration this whole time)
 //
 // Each method is genuinely wired to make the live HTTP call — it will work
 // the moment real credentials are placed in .env. If a key is missing or a
@@ -16,13 +19,13 @@
 //   FCM_SERVER_KEY=...
 //   TERMII_API_KEY=...
 //   TERMII_SENDER_ID=ASUPCICS
-//   MAIL_MAILER=smtp (+ standard Laravel mail config)
+//   RESEND_API_KEY=...
+//   RESEND_FROM_ADDRESS="ASUP CICS <onboarding@resend.dev>"   (optional — this default works with zero setup)
 
 namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 
 class NotificationService
 {
@@ -92,12 +95,48 @@ class NotificationService
         }
     }
 
+    // CHANGED FROM RAW SMTP TO RESEND'S HTTP API.
+    //
+    // This used to go through Laravel's Mail facade (Mail::raw(), raw SMTP
+    // socket to smtp.gmail.com:587). That's what was actually breaking
+    // registration: Railway blocks outbound SMTP entirely on Free/Trial/
+    // Hobby plans (confirmed directly from Railway's own support
+    // responses) — the connection would just hang until PHP's 30-second
+    // execution limit killed the whole request with a Fatal Error, which
+    // is why the app only ever saw a dead connection/timeout, never an
+    // actual error message, and the member never reached the OTP screen
+    // even though the Member record itself had already been created.
+    //
+    // Switching to Resend's plain HTTPS API sidesteps this completely —
+    // ordinary HTTPS (port 443) isn't blocked the way raw SMTP ports are,
+    // and this will keep working the same way on Render or any other host
+    // later, since nothing here depends on SMTP ports being open at all.
+    //
+    // Required .env key: RESEND_API_KEY=... (free tier, no domain
+    // verification needed if sending from the default onboarding@resend.dev
+    // address — see RESEND_FROM_ADDRESS below).
     public function sendEmail(string $email, string $subject, string $body): bool
     {
+        $apiKey = config('services.resend.api_key', env('RESEND_API_KEY'));
+        $from   = config('services.resend.from_address', env('RESEND_FROM_ADDRESS', 'ASUP CICS <onboarding@resend.dev>'));
+
+        if (!$apiKey) {
+            Log::warning('NotificationService: RESEND_API_KEY not configured — email not sent.');
+            return false;
+        }
+
         try {
-            Mail::raw($body, function ($message) use ($email, $subject) {
-                $message->to($email)->subject($subject);
-            });
+            $response = Http::withToken($apiKey)->post('https://api.resend.com/emails', [
+                'from'    => $from,
+                'to'      => [$email],
+                'subject' => $subject,
+                'text'    => $body,
+            ]);
+
+            if (!$response->successful()) {
+                Log::error('NotificationService: Resend email failed', ['response' => $response->body()]);
+                return false;
+            }
             return true;
         } catch (\Throwable $e) {
             Log::error('NotificationService: email exception', ['error' => $e->getMessage()]);

@@ -14,7 +14,7 @@ tab; Render → Environment tab; same idea, different UI).
 | Variable | Required for | Notes |
 |---|---|---|
 | `APP_KEY` | Everything | Laravel generates this — run `php artisan key:generate` if missing |
-| `MAIL_MAILER`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_ENCRYPTION`, `MAIL_FROM_ADDRESS` | OTP emails, password reset emails | Gmail SMTP + a Gmail **App Password** (not your normal password) |
+| `RESEND_API_KEY`, `RESEND_FROM_ADDRESS` | OTP emails, password reset emails | Free tier at resend.com, no domain verification needed with the default `onboarding@resend.dev` sender |
 | `TERMII_API_KEY`, `TERMII_SENDER_ID` | SMS OTP option only | Optional — Email verification works without this. Free trial only sends to your own verified number until upgraded. |
 | `PAYSTACK_SECRET_KEY` | Bank account verification (registration + Personal Data edit) | Free test-mode key works — no real payments are ever made with it, it's only used for account-number lookups |
 
@@ -22,7 +22,31 @@ tab; Render → Environment tab; same idea, different UI).
 clear error message (not a crash) — e.g. registration still works even with
 no Paystack key, it just can't verify the account number field.
 
-## 2. The scheduled job (monthly loan deductions)
+## 2. Why email uses Resend's API instead of SMTP — read this before Render
+
+This app used to send OTP/password-reset emails via raw SMTP (Gmail,
+`MAIL_MAILER=smtp`). That was the actual root cause of registration
+silently failing for a long time: **Railway blocks outbound SMTP (ports
+587/465) entirely on Free, Trial, and Hobby plans** — confirmed directly
+from Railway's own support responses. The connection would just hang until
+PHP's execution time limit killed the request with a fatal error, which is
+why the app only ever showed a dead "connection timeout," never a real
+error message, even though the member record had already been created
+server-side.
+
+The fix: `NotificationService::sendEmail()` now calls **Resend's plain
+HTTPS API** instead of SMTP. This matters for your Render move too — most
+free-tier PaaS hosts block raw SMTP for the same anti-abuse reasons, so
+this isn't just a Railway quirk. Using an HTTPS-based email API (Resend,
+or similar — Mailgun/Postmark/SendGrid all work the same way) is the
+actually-portable choice here, not something to revert back to SMTP later.
+
+If you ever do end up on a host/plan that *does* allow outbound SMTP, the
+old `MAIL_*` config is still sitting in `.env.example` for reference, but
+nothing in the code reads it anymore — you'd need to revert
+`sendEmail()` back to using Laravel's `Mail` facade to use it again.
+
+## 3. The scheduled job (monthly loan deductions)
 
 `app/Console/Commands/ProcessLoanDeductions.php` needs to actually run once a
 day for automatic loan repayments to happen. Defining it in
@@ -41,7 +65,29 @@ due), or you run `php artisan schedule:work` as a standing process.
   `php artisan loans:process-deductions` manually in the host's console
   whenever you want to show the feature working.
 
-## 3. Things that must be updated by hand when switching hosts
+## 3a. Render specifically needs a Dockerfile
+
+Railway auto-detects and builds PHP/Laravel apps with no extra files needed.
+Render's supported path for PHP goes through Docker instead — `Dockerfile`
+and `scripts/00-laravel-deploy.sh` in this repo exist only for that; Railway
+ignores them completely, so having both files doesn't affect Railway at all.
+
+The deploy script runs `migrate --force` automatically on every Render
+deploy — unlike Railway, where that had to be run by hand in the Console
+tab after each push.
+
+## 3b. Database on Render — kept on Railway, not migrated
+
+Render has no free managed MySQL (only Postgres is managed there; MySQL on
+Render would need a paid persistent disk, same ephemeral-filesystem problem
+as SQLite). The simplest, zero-risk option: keep the existing Railway MySQL
+database exactly where it is, and point the Render-hosted app at it using
+Railway's **public** MySQL connection details (not the internal
+`mysql.railway.internal` host, which only works for other services inside
+Railway's own network) — found on the MySQL service's own Variables tab in
+Railway, not the backend service's.
+
+## 4. Things that must be updated by hand when switching hosts
 
 These aren't automatic — you have to physically go change them:
 
@@ -57,7 +103,7 @@ These aren't automatic — you have to physically go change them:
    everything). Render's free tier, for example, resets the filesystem on
    redeploy unless you add a paid persistent disk.
 
-## 4. Nothing in the PHP code itself is Railway-specific
+## 5. Nothing in the PHP code itself is Railway-specific
 
 Checked: no hardcoded Railway URLs, no Railway-only config, no CORS rules
 tied to a specific host. The backend code is portable as-is — only the
