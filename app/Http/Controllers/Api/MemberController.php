@@ -67,7 +67,11 @@ class MemberController extends Controller
                 'desc'   => $t->description,
                 'date'   => $t->created_at->format('Y-m-d'),
                 'risk'   => $t->risk_score,
-                'status' => $t->fraud_flag ? 'flagged' : $t->status,
+                // Only "flagged" while actually still held (status stays
+                // 'pending' until an admin resolves it) — previously this
+                // checked fraud_flag alone, which never changes once set,
+                // so a resolved transaction kept showing "Flagged" forever.
+                'status' => ($t->fraud_flag && $t->status === 'pending') ? 'flagged' : $t->status,
             ]),
             'active_loan'   => $activeLoan ? [
                 'id'         => $activeLoan->loan_id,
