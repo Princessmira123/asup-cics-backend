@@ -175,7 +175,8 @@ class TransactionController extends Controller
 
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json(['success' => false, 'message' => 'Transfer failed. Please try again.'], 500);
+            \Log::error('Transfer failed', ['error' => $e->getMessage(), 'at' => basename($e->getFile()).':'.$e->getLine()]);
+            return response()->json(['success' => false, 'message' => 'Transfer failed: ' . $e->getMessage(), 'exception' => get_class($e)], 500);
         }
     }
 
@@ -215,7 +216,8 @@ class TransactionController extends Controller
             ]);
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json(['success' => false, 'message' => 'Deposit failed.'], 500);
+            \Log::error('Deposit failed', ['error' => $e->getMessage(), 'at' => basename($e->getFile()).':'.$e->getLine()]);
+            return response()->json(['success' => false, 'message' => 'Deposit failed: ' . $e->getMessage(), 'exception' => get_class($e)], 500);
         }
     }
 
@@ -228,7 +230,7 @@ class TransactionController extends Controller
             'desc'       => $t->description,
             'date'       => $t->created_at->format('Y-m-d'),
             'risk'       => $t->risk_score,
-            'status'     => $t->fraud_flag ? 'flagged' : $t->status,
+            'status'     => ($t->fraud_flag && $t->status === 'pending') ? 'flagged' : $t->status,
             'reference'  => $t->reference_number,
         ];
     }

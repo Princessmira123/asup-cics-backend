@@ -207,7 +207,12 @@ class LoanController extends Controller
 
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json(['success' => false, 'message' => 'Application failed. Please try again.'], 500);
+            \Log::error('Loan application failed', ['member_id' => $member->id ?? null, 'error' => $e->getMessage(), 'at' => basename($e->getFile()).':'.$e->getLine()]);
+            return response()->json([
+                'success'   => false,
+                'message'   => 'Application failed: ' . $e->getMessage(),
+                'exception' => get_class($e),
+            ], 500);
         }
     }
 
@@ -276,23 +281,32 @@ class LoanController extends Controller
             return response()->json(['success' => false, 'message' => 'Repayment blocked due to high fraud risk. Admin has been notified.', 'risk_score' => $riskScore], 403);
         }
 
+        $isFlagged = $riskScore >= 70; // <90 already blocked and returned above
+
         DB::beginTransaction();
         try {
             $totalPaid  = LoanRepayment::where('loan_id', $loan->id)->sum('amount_paid');
             $newPaid    = $totalPaid + $request->amount;
             $balance    = $loan->amount_approved - $newPaid;
 
-            LoanRepayment::create([
-                'loan_id'          => $loan->id,
-                'amount_paid'      => $request->amount,
-                'balance_remaining'=> max(0, $balance),
-                'payment_date'     => now(),
-                'status'           => 'completed',
-            ]);
+            // Flagged repayments are held entirely — no LoanRepayment
+            // record, no balance deduction, no loan-completion check —
+            // until an admin reviews it. Otherwise a flagged repayment
+            // could incorrectly mark a loan "fully repaid" before anyone's
+            // actually confirmed the payment was legitimate.
+            if (!$isFlagged) {
+                LoanRepayment::create([
+                    'loan_id'          => $loan->id,
+                    'amount_paid'      => $request->amount,
+                    'balance_remaining'=> max(0, $balance),
+                    'payment_date'     => now(),
+                    'status'           => 'completed',
+                ]);
 
-            $account->decrement('balance', $request->amount);
+                $account->decrement('balance', $request->amount);
+            }
 
-            Transaction::create([
+            $transaction = Transaction::create([
                 'account_id'       => $account->id,
                 'member_id'        => $member->id,
                 'transaction_type' => 'debit',
@@ -300,33 +314,37 @@ class LoanController extends Controller
                 'reference_number' => 'REP-' . strtoupper(Str::random(8)),
                 'description'      => 'Loan Repayment - ' . $loan->loan_id,
                 'risk_score'       => $riskScore,
-                'fraud_flag'       => $riskScore >= 70,
-                'status'           => 'completed',
+                'fraud_flag'       => $isFlagged,
+                'status'           => $isFlagged ? 'pending' : 'completed',
             ]);
 
-            if ($balance <= 0) {
+            if (!$isFlagged && $balance <= 0) {
                 $loan->update(['status' => 'completed']);
                 $this->notifService->sendPush($member->fcm_token, 'Loan Fully Repaid 🎉', "Congratulations! Your loan {$loan->loan_id} has been fully repaid.");
             }
 
             DB::commit();
 
-            if ($riskScore >= 70) {
-                $this->fraudService->createAlert($member->id, null, 'Flagged Loan Repayment', $riskScore, $request->amount);
+            if ($isFlagged) {
+                $this->fraudService->createAlert($member->id, $transaction->id, 'Flagged Loan Repayment', $riskScore, $request->amount);
                 $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'Flagged Loan Repayment');
             }
 
             return response()->json([
                 'success'     => true,
-                'message'     => 'Repayment successful',
-                'amount_paid' => $request->amount,
-                'balance'     => max(0, $balance),
-                'loan_status' => $balance <= 0 ? 'completed' : 'active',
+                'message'     => $isFlagged
+                    ? 'Your repayment was flagged for review and has not been applied yet. You\'ll be notified once an admin resolves it.'
+                    : 'Repayment successful',
+                'flagged'     => $isFlagged,
+                'amount_paid' => $isFlagged ? 0 : $request->amount,
+                'balance'     => $isFlagged ? max(0, $loan->amount_approved - $totalPaid) : max(0, $balance),
+                'loan_status' => (!$isFlagged && $balance <= 0) ? 'completed' : 'active',
             ]);
 
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json(['success' => false, 'message' => 'Repayment failed'], 500);
+            \Log::error('Loan repayment failed', ['member_id' => $member->id ?? null, 'error' => $e->getMessage(), 'at' => basename($e->getFile()).':'.$e->getLine()]);
+            return response()->json(['success' => false, 'message' => 'Repayment failed: ' . $e->getMessage(), 'exception' => get_class($e)], 500);
         }
     }
 

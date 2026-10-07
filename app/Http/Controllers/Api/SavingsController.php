@@ -72,12 +72,23 @@ class SavingsController extends Controller
             return response()->json(['success' => false, 'message' => 'Transaction blocked due to high fraud risk. Admin has been notified.', 'risk_score' => $riskScore], 403);
         }
 
+        $isFlagged = $riskScore >= 70; // <90 already blocked and returned above
+
         DB::beginTransaction();
         try {
-            $account->increment('balance', $request->amount);
-            $account->increment('savings_balance', $request->amount);
+            // Flagged transactions (70-89) are deliberately NOT applied to
+            // the balance yet — the money stays held until an admin
+            // reviews it. Only normal (<70) contributions credit
+            // immediately. status stays 'pending' for a held one; an
+            // admin's resolve() call is what later either applies it
+            // (status -> 'completed') or leaves it pending/flagged
+            // permanently if rejected.
+            if (!$isFlagged) {
+                $account->increment('balance', $request->amount);
+                $account->increment('savings_balance', $request->amount);
+            }
 
-            Transaction::create([
+            $transaction = Transaction::create([
                 'account_id'       => $account->id,
                 'member_id'        => $member->id,
                 'transaction_type' => 'credit',
@@ -85,25 +96,29 @@ class SavingsController extends Controller
                 'reference_number' => 'SAV-' . strtoupper(Str::random(8)),
                 'description'      => $request->description ?? 'Savings Contribution',
                 'risk_score'       => $riskScore,
-                'fraud_flag'       => $riskScore >= 70,
-                'status'           => 'completed',
+                'fraud_flag'       => $isFlagged,
+                'status'           => $isFlagged ? 'pending' : 'completed',
             ]);
 
             DB::commit();
 
-            if ($riskScore >= 70) {
-                $this->fraudService->createAlert($member->id, null, 'Flagged Savings Contribution', $riskScore, $request->amount);
+            if ($isFlagged) {
+                $this->fraudService->createAlert($member->id, $transaction->id, 'Flagged Savings Contribution', $riskScore, $request->amount);
                 $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'Flagged Savings Contribution');
             }
 
             return response()->json([
                 'success'         => true,
-                'message'         => 'Contribution recorded',
+                'message'         => $isFlagged
+                    ? 'Your contribution was flagged for review and has not been added to your balance yet. You\'ll be notified once an admin resolves it.'
+                    : 'Contribution recorded',
+                'flagged'         => $isFlagged,
                 'new_savings'     => $account->fresh()->savings_balance,
             ]);
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json(['success' => false, 'message' => 'Contribution failed'], 500);
+            \Log::error('Savings contribution failed', ['member_id' => $member->id ?? null, 'error' => $e->getMessage(), 'at' => basename($e->getFile()).':'.$e->getLine()]);
+            return response()->json(['success' => false, 'message' => 'Contribution failed: ' . $e->getMessage(), 'exception' => get_class($e)], 500);
         }
     }
 

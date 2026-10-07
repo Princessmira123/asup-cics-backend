@@ -319,7 +319,8 @@ class AdminController extends Controller
 
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json(['success' => false, 'message' => 'Approval failed'], 500);
+            \Log::error('Loan approval failed', ['loan_id' => $id ?? null, 'error' => $e->getMessage(), 'at' => basename($e->getFile()).':'.$e->getLine()]);
+            return response()->json(['success' => false, 'message' => 'Approval failed: ' . $e->getMessage(), 'exception' => get_class($e)], 500);
         }
     }
 

@@ -87,14 +87,23 @@ class PaymentController extends Controller
 
         $type  = $request->payment_type_id ? PaymentType::find($request->payment_type_id) : null;
         $label = $type->name ?? $request->label;
+        $isFlagged = $riskScore >= 70; // <90 already blocked and returned above
 
         DB::beginTransaction();
         try {
-            $account->decrement('balance', $request->amount);
-
             $reference = 'PAY-' . strtoupper(Str::random(8));
 
-            Transaction::create([
+            // Flagged payments are held — balance isn't touched and no
+            // Payment record is created yet (payments.status only allows
+            // completed/failed, no pending, so the Payment row itself gets
+            // created later by resolve() once approved — the Transaction
+            // row below is the only record of a held payment in the
+            // meantime).
+            if (!$isFlagged) {
+                $account->decrement('balance', $request->amount);
+            }
+
+            $transaction = Transaction::create([
                 'account_id'       => $account->id,
                 'member_id'        => $member->id,
                 'transaction_type' => 'debit',
@@ -102,35 +111,42 @@ class PaymentController extends Controller
                 'reference_number' => $reference,
                 'description'      => $label,
                 'risk_score'       => $riskScore,
-                'fraud_flag'       => $riskScore >= 70,
-                'status'           => 'completed',
+                'fraud_flag'       => $isFlagged,
+                'status'           => $isFlagged ? 'pending' : 'completed',
             ]);
 
-            $payment = Payment::create([
-                'member_id'          => $member->id,
-                'payment_type_id'    => $type->id ?? null,
-                'payment_type_label' => $label,
-                'amount'             => $request->amount,
-                'reference_number'   => $reference,
-                'status'             => 'completed',
-            ]);
+            $payment = null;
+            if (!$isFlagged) {
+                $payment = Payment::create([
+                    'member_id'          => $member->id,
+                    'payment_type_id'    => $type->id ?? null,
+                    'payment_type_label' => $label,
+                    'amount'             => $request->amount,
+                    'reference_number'   => $reference,
+                    'status'             => 'completed',
+                ]);
+            }
 
             DB::commit();
 
-            if ($riskScore >= 70) {
-                $this->fraudService->createAlert($member->id, null, 'Flagged Payment', $riskScore, $request->amount);
+            if ($isFlagged) {
+                $this->fraudService->createAlert($member->id, $transaction->id, 'Flagged Payment', $riskScore, $request->amount);
                 $this->notifService->sendFraudAlertToAdmins($member->full_name, $member->member_id, $request->amount, $riskScore, 'Flagged Payment');
             }
 
             return response()->json([
                 'success'     => true,
-                'message'     => 'Payment completed',
+                'message'     => $isFlagged
+                    ? 'Your payment was flagged for review and has not been deducted yet. You\'ll be notified once an admin resolves it.'
+                    : 'Payment completed',
+                'flagged'     => $isFlagged,
                 'payment'     => $payment,
                 'new_balance' => $account->fresh()->balance,
             ]);
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json(['success' => false, 'message' => 'Payment failed'], 500);
+            \Log::error('Payment failed', ['member_id' => $member->id ?? null, 'error' => $e->getMessage(), 'at' => basename($e->getFile()).':'.$e->getLine()]);
+            return response()->json(['success' => false, 'message' => 'Payment failed: ' . $e->getMessage(), 'exception' => get_class($e)], 500);
         }
     }
 }
